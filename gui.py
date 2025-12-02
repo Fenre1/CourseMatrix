@@ -141,6 +141,17 @@ class MainWindow(QMainWindow):
         self.courses_button.clicked.connect(self.on_load_courses)
         button_bar.addWidget(self.courses_button)
 
+        self.zoom_out_button = QPushButton("Zoom -", self)
+        self.zoom_out_button.clicked.connect(self.on_zoom_out)
+        button_bar.addWidget(self.zoom_out_button)
+
+        self.zoom_in_button = QPushButton("Zoom +", self)
+        self.zoom_in_button.clicked.connect(self.on_zoom_in)
+        button_bar.addWidget(self.zoom_in_button)
+
+        self.zoom_label = QLabel("100%", self)
+        button_bar.addWidget(self.zoom_label)
+
         button_bar.addStretch(1)
         layout.addLayout(button_bar)
 
@@ -152,6 +163,11 @@ class MainWindow(QMainWindow):
         self.table_view.verticalHeader().setDefaultSectionSize(28)
         self.table_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
         layout.addWidget(self.table_view)
+
+        self._zoom_factor = 1.0
+        self._base_font_size = self.table_view.font().pointSizeF()
+        self._base_row_height = self.table_view.verticalHeader().defaultSectionSize()
+        self._apply_zoom()
 
         status_bar = QStatusBar(self)
         self.setStatusBar(status_bar)
@@ -215,6 +231,13 @@ class MainWindow(QMainWindow):
             self.student_dock.clear()
             self.course_dock.clear()
 
+    def on_zoom_in(self) -> None:
+        self._adjust_zoom(0.1)
+
+    def on_zoom_out(self) -> None:
+        self._adjust_zoom(-0.1)
+
+
     # Helpers -----------------------------------------------------------
     def _rebuild_matrix(self) -> None:
         matrix = self.data_model.build_matrix()
@@ -222,6 +245,7 @@ class MainWindow(QMainWindow):
         self.table_view.clearSelection()
         self.table_view.resizeColumnsToContents()
         self.table_view.resizeRowsToContents()
+        self._apply_zoom()        
         self.student_dock.clear()
         self.course_dock.clear()
         if matrix.is_empty:
@@ -233,6 +257,26 @@ class MainWindow(QMainWindow):
 
     def _show_error(self, title: str, message: str) -> None:
         QMessageBox.critical(self, title, message)
+
+    def _adjust_zoom(self, delta: float) -> None:
+        self._zoom_factor = min(2.0, max(0.5, self._zoom_factor + delta))
+        self._apply_zoom()
+
+    def _apply_zoom(self) -> None:
+        font_size = max(6.0, self._base_font_size * self._zoom_factor)
+
+        table_font = self.table_view.font()
+        table_font.setPointSizeF(font_size)
+        self.table_view.setFont(table_font)
+
+        header_font = self.table_view.horizontalHeader().font()
+        header_font.setPointSizeF(font_size)
+        self.table_view.horizontalHeader().setFont(header_font)
+        self.table_view.verticalHeader().setFont(header_font)
+
+        row_height = int(self._base_row_height * self._zoom_factor)
+        self.table_view.verticalHeader().setDefaultSectionSize(row_height)
+        self.zoom_label.setText(f"{int(self._zoom_factor * 100)}%")
 
 
 def run() -> None:
