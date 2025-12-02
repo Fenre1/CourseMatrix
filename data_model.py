@@ -7,6 +7,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import json
 import pandas as pd
 
+from filter_dialog import FilterCriterion
 
 __all__ = [
     "CourseDataModel",
@@ -144,7 +145,7 @@ class CourseDataModel:
         self.completion_column: Optional[str] = None
         self.course_lookup_by_qid: Dict[str, pd.Series] = {}
         self.matrix_data: MatrixData = MatrixData([], [], {})
-
+        self.filters: list[FilterCriterion] = []
     # ------------------------------------------------------------------
     # Loading routines
     # ------------------------------------------------------------------
@@ -188,6 +189,7 @@ class CourseDataModel:
         df[self.student_id_column] = df[self.student_id_column].astype(str)
 
         self.matrix_data = MatrixData([], [], {})
+        self.filters = []        
 
     def load_courses(self, path: str | Path) -> None:
         courses_df, kwalificaties_df = load_courses_from_hdf5(path)
@@ -208,8 +210,10 @@ class CourseDataModel:
             self.matrix_data = MatrixData([], [], {})
             return self.matrix_data
 
+        students_df = self._apply_filters(self.students_df)
+
         students: List[StudentDescriptor] = []
-        for _, student_rows in self.students_df.groupby(self.student_id_column):
+        for _, student_rows in students_df.groupby(self.student_id_column):
             student_id = str(student_rows[self.student_id_column].iloc[0])
             if self.student_name_column and self.student_name_column in student_rows.columns:
                 name_value = student_rows[self.student_name_column].iloc[0]
@@ -223,7 +227,7 @@ class CourseDataModel:
             return self.matrix_data
 
         unique_qids = (
-            self.students_df[self.qid_column]
+            students_df[self.qid_column]
             .dropna()
             .astype(str)
             .unique()
@@ -273,6 +277,12 @@ class CourseDataModel:
     # Helper accessors
     # ------------------------------------------------------------------
 
+    def set_filters(self, filters: list[FilterCriterion]) -> None:
+        self.filters = filters
+        # Reset cached matrix so it is rebuilt on demand
+        self.matrix_data = MatrixData([], [], {})
+
+
     def get_cell(self, row: int, column: int) -> Optional[CellDescriptor]:
         if not self.matrix_data.cell_lookup:
             return None
@@ -320,3 +330,75 @@ class CourseDataModel:
                 if isinstance(value, str) and value.strip():
                     return f"{value} ({qid})"
         return str(qid)
+    
+    def _apply_filters(self, df: pd.DataFrame) -> pd.DataFrame:
+        if not self.filters:
+            return df
+
+        filtered = df
+        for criterion in self.filters:
+            if criterion.column not in filtered.columns:
+                continue
+
+            series = filtered[criterion.column]
+            if criterion.value_type == "categorical":
+                values = [str(v) for v in criterion.values if pd.notna(v)]
+                if not values:
+                    continue
+                series_str = series.astype(str)
+                if criterion.operator == "is":
+                    mask = series_str == values[0]
+                elif criterion.operator == "is not":
+                    mask = series_str != values[0]
+                elif criterion.operator == "not in":
+                    mask = ~series_str.isin(values)
+                else:  # in
+                    mask = series_str.isin(values)
+            elif criterion.value_type == "date":
+                series_dt = pd.to_datetime(series, errors="coerce")
+                if not criterion.values:
+                    continue
+                start = pd.to_datetime(criterion.values[0], errors="coerce")
+                end = pd.to_datetime(criterion.values[1], errors="coerce") if len(criterion.values) > 1 else None
+                if pd.isna(start):
+                    continue
+                if criterion.operator == "between" and end is not None and not pd.isna(end):
+                    mask = (series_dt >= start) & (series_dt <= end)
+                elif criterion.operator == "≠":
+                    mask = series_dt != start
+                elif criterion.operator == "<":
+                    mask = series_dt < start
+                elif criterion.operator == "≤":
+                    mask = series_dt <= start
+                elif criterion.operator == ">":
+                    mask = series_dt > start
+                elif criterion.operator == "≥":
+                    mask = series_dt >= start
+                else:
+                    mask = series_dt == start
+            else:  # numeric
+                numeric_series = pd.to_numeric(series, errors="coerce")
+                if not criterion.values:
+                    continue
+                start = pd.to_numeric(criterion.values[0], errors="coerce")
+                end = pd.to_numeric(criterion.values[1], errors="coerce") if len(criterion.values) > 1 else None
+                if pd.isna(start):
+                    continue
+                if criterion.operator == "between" and end is not None and not pd.isna(end):
+                    mask = (numeric_series >= start) & (numeric_series <= end)
+                elif criterion.operator == "≠":
+                    mask = numeric_series != start
+                elif criterion.operator == "<":
+                    mask = numeric_series < start
+                elif criterion.operator == "≤":
+                    mask = numeric_series <= start
+                elif criterion.operator == ">":
+                    mask = numeric_series > start
+                elif criterion.operator == "≥":
+                    mask = numeric_series >= start
+                else:
+                    mask = numeric_series == start
+
+            filtered = filtered[mask]
+
+        return filtered    

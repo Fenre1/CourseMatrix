@@ -23,6 +23,7 @@ from PyQt5.QtWidgets import (
 
 from course_dock import CourseInfoDock
 from data_model import CellDescriptor, CourseDataModel, MatrixData
+from filter_dialog import FilterDialog
 from student_dock import StudentInfoDock
 
 
@@ -143,6 +144,10 @@ class MainWindow(QMainWindow):
         self.courses_button.clicked.connect(self.on_load_courses)
         button_bar.addWidget(self.courses_button)
 
+        self.filter_button = QPushButton("Student Filters…", self)
+        self.filter_button.clicked.connect(self.on_open_filters)
+        button_bar.addWidget(self.filter_button)
+
         self.zoom_out_button = QPushButton("Zoom -", self)
         self.zoom_out_button.clicked.connect(self.on_zoom_out)
         button_bar.addWidget(self.zoom_out_button)
@@ -231,6 +236,17 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # pragma: no cover - UI feedback
             self._show_error("Unable to load courses", str(exc))
 
+    def on_open_filters(self) -> None:
+        if self.data_model.students_df is None:
+            self._show_error("Load students first", "Please load a student Excel file before filtering.")
+            return
+
+        columns, values_by_column = self._gather_filter_metadata()
+        dialog = FilterDialog(columns, values_by_column, self.data_model.filters, self)
+        if dialog.exec_():
+            self.data_model.set_filters(dialog.filters())
+            self._rebuild_matrix()
+
     def on_selection_changed(self, selected: QItemSelection, _: QItemSelection) -> None:
         if selected.indexes():
             index = selected.indexes()[0]
@@ -269,8 +285,9 @@ class MainWindow(QMainWindow):
         if matrix.is_empty:
             self.status_label.setText("Matrix is empty. Ensure both datasets overlap.")
         else:
+            filter_suffix = "" if not self.data_model.filters else f" | {len(self.data_model.filters)} filter(s) applied"
             self.status_label.setText(
-                f"Showing {len(matrix.students)} students x {len(matrix.courses)} courses"
+                f"Showing {len(matrix.students)} students x {len(matrix.courses)} courses{filter_suffix}"
             )
 
     def _show_error(self, title: str, message: str) -> None:
@@ -379,6 +396,44 @@ class MainWindow(QMainWindow):
             return
         self._zoom_factor = min(self._zoom_factor, fit_zoom)
         self._apply_zoom()
+
+    def _gather_filter_metadata(self):
+        assert self.data_model.students_df is not None
+        df = self.data_model.students_df
+
+        columns: dict[str, str] = {}
+        values_by_column: dict[str, list[object]] = {}
+
+        for column in df.columns:
+            series = df[column]
+            value_type = self._infer_value_type(series)
+            columns[column] = value_type
+            if value_type == "categorical":
+                unique_values = series.dropna().unique().tolist()
+                values_by_column[column] = sorted(unique_values, key=lambda v: str(v))[:500]
+
+        return columns, values_by_column
+
+    @staticmethod
+    def _infer_value_type(series: pd.Series) -> str:
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return "date"
+
+        parsed_dates = pd.to_datetime(series, errors="coerce")
+        if parsed_dates.notna().sum() > 0:
+            non_na_ratio = parsed_dates.notna().mean()
+            if non_na_ratio >= 0.2:
+                return "date"
+
+        if pd.api.types.is_numeric_dtype(series):
+            return "numeric"
+
+        numeric_coerced = pd.to_numeric(series, errors="coerce")
+        if numeric_coerced.notna().any():
+            return "numeric"
+
+        return "categorical"
+
 
     def resizeEvent(self, event):  # type: ignore[override]
         super().resizeEvent(event)
