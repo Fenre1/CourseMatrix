@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from PyQt5.QtCore import QItemSelection, QModelIndex, Qt
+from PyQt5.QtCore import QEvent, QItemSelection, QModelIndex, Qt
 from PyQt5.QtGui import QColor, QBrush
 from PyQt5.QtWidgets import (
     QApplication,
@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
     QTableView,
     QVBoxLayout,
     QWidget,
+    QHeaderView,
 )
 
 from course_dock import CourseInfoDock
@@ -126,6 +127,7 @@ class MainWindow(QMainWindow):
         self._create_docks()
 
     # UI setup ----------------------------------------------------------
+    
     def _create_ui(self) -> None:
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
@@ -159,12 +161,25 @@ class MainWindow(QMainWindow):
         self.table_view.setModel(self.table_model.qt_model())
         self.table_view.setSelectionMode(QTableView.SingleSelection)
         self.table_view.setSelectionBehavior(QTableView.SelectItems)
+        
+        # --- CRITICAL FIX START ---
+        # Allow headers to shrink to 0 pixels (removes the ~20px limit)
+        self.table_view.verticalHeader().setMinimumSectionSize(0)
+        self.table_view.horizontalHeader().setMinimumSectionSize(0)
+        # --- CRITICAL FIX END ---
+
         self.table_view.horizontalHeader().setStretchLastSection(True)
         self.table_view.verticalHeader().setDefaultSectionSize(28)
         self.table_view.selectionModel().selectionChanged.connect(self.on_selection_changed)
+        self.table_view.viewport().installEventFilter(self)
+        self.table_view.installEventFilter(self)
+        self._base_column_widths: list[int] = []
         layout.addWidget(self.table_view)
 
         self._zoom_factor = 1.0
+        self._min_zoom_factor = 0.5
+        self._max_zoom_factor = 4.0
+        self._ABSOLUTE_MIN_ZOOM = 0.0001  # Allow extremely small zoom
         self._base_font_size = self.table_view.font().pointSizeF()
         self._base_row_height = self.table_view.verticalHeader().defaultSectionSize()
         self._apply_zoom()
@@ -173,6 +188,8 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status_bar)
         self.status_label = QLabel("Load student and course files to begin.")
         status_bar.addPermanentWidget(self.status_label)
+
+  
 
     def _create_docks(self) -> None:
         self.student_dock = StudentInfoDock(self)
@@ -245,7 +262,8 @@ class MainWindow(QMainWindow):
         self.table_view.clearSelection()
         self.table_view.resizeColumnsToContents()
         self.table_view.resizeRowsToContents()
-        self._apply_zoom()        
+        self._record_base_column_widths()
+        self._fit_table_in_view()
         self.student_dock.clear()
         self.course_dock.clear()
         if matrix.is_empty:
@@ -259,11 +277,18 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, title, message)
 
     def _adjust_zoom(self, delta: float) -> None:
-        self._zoom_factor = min(2.0, max(0.5, self._zoom_factor + delta))
+        self._update_min_zoom()
+        self._zoom_factor = min(self._max_zoom_factor, max(self._min_zoom_factor, self._zoom_factor + delta))
         self._apply_zoom()
 
+    
     def _apply_zoom(self) -> None:
-        font_size = max(6.0, self._base_font_size * self._zoom_factor)
+        self._update_min_zoom()
+        self._zoom_factor = min(self._max_zoom_factor, max(self._min_zoom_factor, self._zoom_factor))
+
+        # 1. Scale Font
+        # Note: Qt font rendering can be unstable below 1pt, but we set it anyway.
+        font_size = max(0.5, self._base_font_size * self._zoom_factor)
 
         table_font = self.table_view.font()
         table_font.setPointSizeF(font_size)
@@ -274,9 +299,97 @@ class MainWindow(QMainWindow):
         self.table_view.horizontalHeader().setFont(header_font)
         self.table_view.verticalHeader().setFont(header_font)
 
-        row_height = int(self._base_row_height * self._zoom_factor)
+        # 2. Scale Rows
+        # We calculate the target height (down to 1 pixel)
+        row_height = max(1, int(round(self._base_row_height * self._zoom_factor)))
+        
+        # FORCE the header to use this size for ALL rows.
+        # 'Fixed' mode ignores individual row sizes and uses defaultSectionSize.
+        self.table_view.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         self.table_view.verticalHeader().setDefaultSectionSize(row_height)
-        self.zoom_label.setText(f"{int(self._zoom_factor * 100)}%")
+
+        # 3. Scale Columns
+        if self._base_column_widths:
+            # We must set resize mode to Interactive or Fixed to allow manual setting
+            self.table_view.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+            for col, width in enumerate(self._base_column_widths):
+                scaled_width = max(1, int(round(width * self._zoom_factor)))
+                self.table_view.setColumnWidth(col, scaled_width)
+
+        # 4. Hide Grid at small scales
+        # If pixels are too small, grid lines (which are 1px) will turn the view gray.
+        if row_height < 3:
+            self.table_view.setShowGrid(False)
+        else:
+            self.table_view.setShowGrid(True)
+
+        self.zoom_label.setText(f"{self._zoom_factor * 100:.1f}%")
+
+  
+
+    def _record_base_column_widths(self) -> None:
+        column_count = len(self.table_model._matrix.courses)
+        self._base_column_widths = [self.table_view.columnWidth(i) for i in range(column_count)]
+
+    def _compute_fit_zoom(self) -> float | None:
+        viewport = self.table_view.viewport()
+        
+        # Calculate total rows and columns
+        # Note: We use the matrix directly as the model returns 0 if parent is valid
+        rows = len(self.table_model._matrix.students)
+        cols = len(self.table_model._matrix.courses)
+
+        fit_candidates: list[float] = []
+        
+        # 1. Calculate vertical fit
+        # We need: (rows * row_height * zoom) <= viewport_height
+        # But physically, row_height * zoom cannot be less than 1.0 pixel.
+        # So the absolute physical limit is viewport_height / rows.
+        if rows > 0 and viewport.height() > 0:
+            # Mathematical fit based on original row height
+            math_fit = viewport.height() / (rows * self._base_row_height)
+            fit_candidates.append(math_fit)
+
+        # 2. Calculate horizontal fit
+        if self._base_column_widths and viewport.width() > 0:
+            total_base_width = sum(self._base_column_widths)
+            if total_base_width > 0:
+                math_fit = viewport.width() / total_base_width
+                fit_candidates.append(math_fit)
+
+        if not fit_candidates:
+            return None
+
+        # Allow zooming out significantly further than before
+        # We take the smallest fit required to see everything
+        target_zoom = min(fit_candidates)
+        
+        # Ensure we don't go below floating point stability or 0
+        return min(max(self._ABSOLUTE_MIN_ZOOM, target_zoom), self._max_zoom_factor)
+
+    def _update_min_zoom(self) -> None:
+        fit_zoom = self._compute_fit_zoom()
+        if fit_zoom is None:
+            return
+        self._min_zoom_factor = max(self._ABSOLUTE_MIN_ZOOM, min(fit_zoom, 1.0))
+
+    def _fit_table_in_view(self) -> None:
+        fit_zoom = self._compute_fit_zoom()
+        if fit_zoom is None:
+            return
+        self._zoom_factor = min(self._zoom_factor, fit_zoom)
+        self._apply_zoom()
+
+    def resizeEvent(self, event):  # type: ignore[override]
+        super().resizeEvent(event)
+        self._fit_table_in_view()
+
+    def eventFilter(self, obj, event):  # type: ignore[override]
+        if event.type() == QEvent.Wheel and event.modifiers() & Qt.ControlModifier:
+            delta = event.angleDelta().y()
+            self._adjust_zoom(0.1 if delta > 0 else -0.1)
+            return True
+        return super().eventFilter(obj, event)
 
 
 def run() -> None:
